@@ -990,6 +990,26 @@ class RayPPOTrainer:
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
             rollout_skip.wrap_generate_sequences()
 
+        # replay buffer (optional, controlled by algorithm.replay_buffer config)
+        replay_buffer = None
+        _rb_cfg = self.config.algorithm.get("replay_buffer", None)
+        if _rb_cfg and _rb_cfg.get("enabled", False):
+            from verl.trainer.ppo.replay_buffer import ReplayBuffer
+
+            _cache_dir = _rb_cfg.get("cache_dir") or os.path.join(
+                self.config.trainer.default_local_dir, "replay_buffer"
+            )
+            replay_buffer = ReplayBuffer(
+                cache_dir=_cache_dir,
+                max_size=int(_rb_cfg.get("max_size", 50)),
+                p_fresh=float(_rb_cfg.get("p_fresh", 0.5)),
+                hot_cache_size=int(_rb_cfg.get("hot_cache_size", 5)),
+            )
+            print(
+                f"[ReplayBuffer] enabled — cache_dir={_cache_dir}, "
+                f"max_size={replay_buffer.max_size}, p_fresh={replay_buffer.p_fresh}"
+            )
+
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -1024,25 +1044,29 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                gen_batch = self._get_gen_batch(batch)
+                from_cache = replay_buffer is not None and replay_buffer.should_replay()
 
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+                if not from_cache:
+                    gen_batch = self._get_gen_batch(batch)
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                        if from_cache:
+                            batch = replay_buffer.sample(self.global_steps)
+                            batch.meta_info["global_steps"] = self.global_steps
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                            if not self.async_rollout_mode:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            else:
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1073,8 +1097,9 @@ class RayPPOTrainer:
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    if not from_cache:
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1089,17 +1114,21 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
-                            )
+                        if from_cache:
+                            reward_tensor = batch.batch["token_level_scores"]
+                            reward_extra_infos_dict = {}
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(
+                                    data=batch, config=self.config, tokenizer=self.tokenizer
+                                )
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     from verl.trainer.ppo.rollout_corr_helper import (
                         compute_rollout_correction_and_add_to_batch,
@@ -1152,9 +1181,15 @@ class RayPPOTrainer:
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if not from_cache and self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+
+                        # save fresh experience to replay buffer
+                        if not from_cache and replay_buffer is not None:
+                            replay_buffer.put(batch, self.global_steps)
+
+                        metrics["rollout/from_cache"] = int(from_cache)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
