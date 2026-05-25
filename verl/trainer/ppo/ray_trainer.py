@@ -992,9 +992,19 @@ class RayPPOTrainer:
 
         # replay buffer (optional, controlled by algorithm.replay_buffer config)
         replay_buffer = None
+        replay_spec_verify = False
+        replay_spec_min_mean_logprob_delta = -1.0
+        replay_spec_min_seq_logprob_delta = -5.0
         _rb_cfg = self.config.algorithm.get("replay_buffer", None)
         if _rb_cfg and _rb_cfg.get("enabled", False):
             from verl.trainer.ppo.replay_buffer import ReplayBuffer
+
+            def _cfg_bool(value, default=False):
+                if value is None:
+                    return default
+                if isinstance(value, bool):
+                    return value
+                return str(value).lower() in {"1", "true", "yes", "on"}
 
             _cache_dir = _rb_cfg.get("cache_dir") or os.path.join(
                 self.config.trainer.default_local_dir, "replay_buffer"
@@ -1005,9 +1015,13 @@ class RayPPOTrainer:
                 p_fresh=float(_rb_cfg.get("p_fresh", 0.5)),
                 hot_cache_size=int(_rb_cfg.get("hot_cache_size", 5)),
             )
+            replay_spec_verify = _cfg_bool(_rb_cfg.get("spec_verify", False))
+            replay_spec_min_mean_logprob_delta = float(_rb_cfg.get("spec_verify_min_mean_logprob_delta", -1.0))
+            replay_spec_min_seq_logprob_delta = float(_rb_cfg.get("spec_verify_min_seq_logprob_delta", -5.0))
             print(
                 f"[ReplayBuffer] enabled — cache_dir={_cache_dir}, "
-                f"max_size={replay_buffer.max_size}, p_fresh={replay_buffer.p_fresh}"
+                f"max_size={replay_buffer.max_size}, p_fresh={replay_buffer.p_fresh}, "
+                f"spec_verify={replay_spec_verify}"
             )
 
         # add tqdm
@@ -1045,22 +1059,71 @@ class RayPPOTrainer:
                 )
 
                 from_cache = replay_buffer is not None and replay_buffer.should_replay()
-
-                if not from_cache:
-                    gen_batch = self._get_gen_batch(batch)
-                    gen_batch.meta_info["global_steps"] = self.global_steps
-                    gen_batch_output = gen_batch.repeat(
-                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                    )
+                cached_old_log_prob = None
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    # Generate a fresh batch, or verify and accept a cached draft trajectory.
                     with marked_timer("gen", timing_raw, color="red"):
                         if from_cache:
-                            batch = replay_buffer.sample(self.global_steps)
-                            batch.meta_info["global_steps"] = self.global_steps
-                        else:
+                            cached_batch = replay_buffer.sample(self.global_steps)
+                            cached_batch.meta_info["global_steps"] = self.global_steps
+                            metrics["replay/spec_verify_enabled"] = int(replay_spec_verify)
+
+                            if replay_spec_verify:
+                                metrics["replay/spec_verify_attempt"] = 1
+                                if "draft_log_probs" not in cached_batch.batch.keys():
+                                    metrics["replay/spec_verify_missing_draft_log_probs"] = 1
+                                    metrics["replay/spec_verify_accept"] = 0
+                                    metrics["replay/spec_verify_reject"] = 1
+                                    from_cache = False
+                                else:
+                                    draft_log_probs = cached_batch.batch["draft_log_probs"]
+                                    cached_batch.pop(batch_keys=["draft_log_probs"])
+                                    with marked_timer("spec_verify", timing_raw, color="blue"):
+                                        verify_log_prob = self.actor_rollout_wg.compute_log_prob(cached_batch)
+                                    current_log_probs = verify_log_prob.batch["old_log_probs"]
+                                    response_masks = cached_batch.batch["response_mask"]
+                                    valid_tokens = response_masks.sum().clamp_min(1)
+                                    logprob_delta = (current_log_probs - draft_log_probs) * response_masks
+                                    mean_delta = logprob_delta.sum() / valid_tokens
+                                    seq_denominator = response_masks.sum(dim=-1).clamp_min(1)
+                                    seq_delta = logprob_delta.sum(dim=-1) / seq_denominator
+                                    min_seq_delta = seq_delta.min()
+                                    accept_cached = (
+                                        mean_delta.item() >= replay_spec_min_mean_logprob_delta
+                                        and min_seq_delta.item() >= replay_spec_min_seq_logprob_delta
+                                    )
+                                    metrics.update(
+                                        {
+                                            "replay/spec_logprob_delta_mean": mean_delta.detach().item(),
+                                            "replay/spec_logprob_delta_min_seq": min_seq_delta.detach().item(),
+                                            "replay/spec_valid_tokens": valid_tokens.detach().item(),
+                                            "replay/spec_verify_accept": int(accept_cached),
+                                            "replay/spec_verify_reject": int(not accept_cached),
+                                        }
+                                    )
+                                    if accept_cached:
+                                        entropys = verify_log_prob.batch["entropys"]
+                                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                                        entropy_agg = agg_loss(
+                                            loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                                        )
+                                        metrics.update({"actor/entropy": entropy_agg.detach().item()})
+                                        verify_log_prob.batch.pop("entropys")
+                                        cached_old_log_prob = verify_log_prob
+                                        batch = cached_batch
+                                    else:
+                                        from_cache = False
+                            else:
+                                batch = cached_batch
+
+                        if not from_cache:
+                            gen_batch = self._get_gen_batch(batch)
+                            gen_batch.meta_info["global_steps"] = self.global_steps
+                            gen_batch_output = gen_batch.repeat(
+                                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                            )
                             if not self.async_rollout_mode:
                                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                             else:
@@ -1103,6 +1166,8 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    if "draft_log_probs" in batch.batch.keys():
+                        batch.pop(batch_keys=["draft_log_probs"])
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1141,7 +1206,9 @@ class RayPPOTrainer:
                         rollout_corr_config=rollout_corr_config,
                         policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                     )
-                    if need_recomputation:
+                    if cached_old_log_prob is not None:
+                        batch = batch.union(cached_old_log_prob)
+                    elif need_recomputation:
                         # LEGACY MODE: Compute old_log_probs from actor
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)

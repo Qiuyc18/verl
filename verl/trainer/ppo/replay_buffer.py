@@ -21,6 +21,7 @@ _TENSOR_FIELDS = [
     "response_mask",
     "token_level_scores",
 ]
+_DRAFT_LOG_PROB_FIELD = "draft_log_probs"
 
 _INDEX_FILE = "meta.json"
 
@@ -28,8 +29,9 @@ _INDEX_FILE = "meta.json"
 class ReplayBuffer:
     """Disk-backed experience replay buffer with LRU hot cache.
 
-    Each entry stores one complete training batch (after rollout + reward),
-    excluding old_log_probs (always recomputed with the current policy on replay).
+    Each entry stores one complete training batch (after rollout + reward).
+    old_log_probs are stored as draft_log_probs for optional speculative-style
+    verification, but training still recomputes current-policy old_log_probs.
 
     Args:
         cache_dir: Directory for .npz files and index.
@@ -75,6 +77,9 @@ class ReplayBuffer:
             if key in batch.batch.keys():
                 arrays[key] = batch.batch[key].cpu().numpy()
 
+        if "old_log_probs" in batch.batch.keys():
+            arrays[_DRAFT_LOG_PROB_FIELD] = batch.batch["old_log_probs"].cpu().numpy()
+
         uid = batch.non_tensor_batch.get("uid")
         if uid is not None:
             arrays["uid"] = np.array(uid, dtype=object)
@@ -104,7 +109,8 @@ class ReplayBuffer:
     def sample(self, step: int) -> DataProto:
         """Sample a random cached batch and return it as DataProto.
 
-        old_log_probs is NOT included — caller must call compute_log_prob.
+        draft_log_probs may be included for verification, but caller must still
+        use current-policy old_log_probs for training.
         """
         entry = random.choice(self._index)
         batch_id = entry["batch_id"]
@@ -147,6 +153,8 @@ class ReplayBuffer:
         for key in _TENSOR_FIELDS:
             if key in data:
                 tensors[key] = torch.from_numpy(data[key])
+        if _DRAFT_LOG_PROB_FIELD in data:
+            tensors[_DRAFT_LOG_PROB_FIELD] = torch.from_numpy(data[_DRAFT_LOG_PROB_FIELD])
         if "uid" in data:
             tensors["uid"] = data["uid"]
         return tensors
