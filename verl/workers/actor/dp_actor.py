@@ -83,6 +83,152 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+    @staticmethod
+    def _mean_exp_decay(decay: float, steps: int, device) -> torch.Tensor:
+        if steps <= 1:
+            return torch.ones(steps, device=device)
+        rel_pos = torch.linspace(0.0, 1.0, steps=steps, device=device)
+        return torch.exp(-decay * rel_pos)
+
+    @classmethod
+    def _rpc_probs_for_length(
+        cls, valid_len: int, response_length: int, keep_ratio: float, min_tokens: int, eps: float, device
+    ) -> torch.Tensor:
+        probs = torch.zeros(response_length, device=device)
+        if valid_len <= 0:
+            return probs
+
+        forced = min(max(min_tokens, 0), valid_len)
+        if forced > 0:
+            probs[:forced] = 1.0
+
+        remaining = valid_len - forced
+        if remaining <= 0:
+            return probs
+
+        target = (keep_ratio * valid_len - forced) / remaining
+        target = min(max(target, eps), 1.0)
+        rel_pos = torch.linspace(0.0, 1.0, steps=remaining, device=device)
+        if target >= 0.5:
+            alpha = min(2.0 * (1.0 - target), 1.0 - eps)
+            tail_probs = 1.0 - alpha * rel_pos
+        else:
+            low, high = 0.0, 128.0
+            for _ in range(32):
+                mid = (low + high) / 2.0
+                mean_prob = cls._mean_exp_decay(mid, remaining, device).mean().item()
+                if mean_prob > target:
+                    low = mid
+                else:
+                    high = mid
+            tail_probs = cls._mean_exp_decay(high, remaining, device)
+        probs[forced:valid_len] = tail_probs.clamp_min(eps)
+        return probs
+
+    @staticmethod
+    def _slice_response_field(value: torch.Tensor, keep_len: int) -> torch.Tensor:
+        return value[:, :keep_len]
+
+    @staticmethod
+    def _slice_sequence_field(value: torch.Tensor, keep_seq_len: int) -> torch.Tensor:
+        if value.dim() == 3:
+            return value[..., :keep_seq_len]
+        return value[:, :keep_seq_len]
+
+    def _apply_token_sampling(self, model_inputs: dict) -> tuple[dict, dict]:
+        token_sampling = self.config.get("token_sampling", None)
+        if not token_sampling or not token_sampling.get("enabled", False):
+            return model_inputs, {}
+
+        mode = str(token_sampling.get("mode", "none")).lower()
+        keep_ratio = float(token_sampling.get("keep_ratio", 1.0))
+        if mode == "none" or keep_ratio >= 1.0:
+            return model_inputs, {}
+        if mode not in {"urs", "rpc"}:
+            raise ValueError(f"Unsupported actor token_sampling.mode: {mode}")
+        if not 0.0 < keep_ratio <= 1.0:
+            raise ValueError(f"actor token_sampling.keep_ratio must be in (0, 1], got {keep_ratio}")
+
+        response_mask = model_inputs["response_mask"]
+        response_length = response_mask.shape[-1]
+        device = response_mask.device
+        valid = response_mask > 0
+        valid_lens = valid.sum(dim=-1).to(torch.long)
+        min_tokens = int(token_sampling.get("min_tokens", 1))
+        eps = float(token_sampling.get("eps", 1e-6))
+
+        probs = torch.zeros_like(response_mask, dtype=torch.float32)
+        if mode == "urs":
+            for row, valid_len_tensor in enumerate(valid_lens):
+                valid_len = int(valid_len_tensor.item())
+                if valid_len <= 0:
+                    continue
+                forced = min(max(min_tokens, 0), valid_len)
+                if forced > 0:
+                    probs[row, :forced] = 1.0
+                remaining = valid_len - forced
+                if remaining > 0:
+                    target = (keep_ratio * valid_len - forced) / remaining
+                    probs[row, forced:valid_len] = min(max(target, eps), 1.0)
+        else:
+            for row, valid_len_tensor in enumerate(valid_lens):
+                probs[row] = self._rpc_probs_for_length(
+                    valid_len=int(valid_len_tensor.item()),
+                    response_length=response_length,
+                    keep_ratio=keep_ratio,
+                    min_tokens=min_tokens,
+                    eps=eps,
+                    device=device,
+                )
+
+        probs = probs * valid.float()
+        sampled = (torch.rand_like(probs) < probs).float() * valid.float()
+        ht_weight = sampled / probs.clamp_min(eps)
+
+        full_valid_tokens = response_mask.float().sum().clamp_min(1.0)
+        max_keep_len = response_length
+        if mode == "rpc" and token_sampling.get("truncate_rpc", True):
+            keep_lens = sampled.sum(dim=-1).to(torch.long)
+            max_keep_len = int(keep_lens.max().item()) if keep_lens.numel() > 0 else response_length
+            max_keep_len = max(1, min(max_keep_len, response_length))
+
+        response_keys = {
+            "responses",
+            "response_mask",
+            "old_log_probs",
+            "advantages",
+            "ref_log_prob",
+            "rollout_is_weights",
+        }
+        sequence_keys = {"input_ids", "attention_mask", "position_ids"}
+        if max_keep_len < response_length:
+            prompt_len = model_inputs["input_ids"].shape[-1] - response_length
+            keep_seq_len = prompt_len + max_keep_len
+            for key in response_keys:
+                if key in model_inputs:
+                    model_inputs[key] = self._slice_response_field(model_inputs[key], max_keep_len)
+            for key in sequence_keys:
+                if key in model_inputs:
+                    model_inputs[key] = self._slice_sequence_field(model_inputs[key], keep_seq_len)
+            sampled = sampled[:, :max_keep_len]
+            probs = probs[:, :max_keep_len]
+            ht_weight = ht_weight[:, :max_keep_len]
+
+        observed_valid_tokens = model_inputs["response_mask"].float().sum().clamp_min(1.0)
+        if self.config.loss_agg_mode == "token-mean":
+            ht_weight = ht_weight * (observed_valid_tokens / full_valid_tokens)
+
+        model_inputs["_nat_loss_weight"] = ht_weight
+        keep_tokens = sampled.sum()
+        prob_sum = (probs * (probs > 0).float()).sum()
+        metrics = {
+            "actor/nat_keep_ratio": (keep_tokens / full_valid_tokens).detach().item(),
+            "actor/nat_prob_mean": (prob_sum / full_valid_tokens).detach().item(),
+            "actor/nat_ht_weight_max": ht_weight.max().detach().item() if ht_weight.numel() > 0 else 0.0,
+            "actor/nat_response_len_ratio": max_keep_len / response_length,
+        }
+        return model_inputs, metrics
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -407,6 +553,8 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    model_inputs, nat_metrics = self._apply_token_sampling(model_inputs)
+                    micro_batch_metrics.update(nat_metrics)
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
@@ -442,6 +590,12 @@ class DataParallelPPOActor(BasePPOActor):
                     # Extract pre-computed rollout correction weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                    nat_loss_weight = model_inputs.get("_nat_loss_weight", None)
+                    if nat_loss_weight is not None:
+                        if rollout_is_weights is None:
+                            rollout_is_weights = nat_loss_weight
+                        else:
+                            rollout_is_weights = rollout_is_weights * nat_loss_weight
 
                     # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
                     # are computed centrally in ray_trainer.py for consistency and efficiency.
@@ -465,6 +619,8 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics.update(pg_metrics)
 
                     if entropy_coeff != 0:
+                        if nat_loss_weight is not None:
+                            entropy = entropy * nat_loss_weight
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         # compute policy loss
@@ -478,6 +634,8 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
+                        if nat_loss_weight is not None:
+                            kld = kld * nat_loss_weight
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef

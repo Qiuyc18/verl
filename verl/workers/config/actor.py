@@ -25,7 +25,19 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = ["TokenSamplingConfig", "PolicyLossConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+
+
+@dataclass
+class TokenSamplingConfig(BaseConfig):
+    """Configuration for NAT-style token-efficient policy updates."""
+
+    enabled: bool = False
+    mode: str = "none"
+    keep_ratio: float = 1.0
+    min_tokens: int = 1
+    truncate_rpc: bool = True
+    eps: float = 1e-6
 
 
 @dataclass
@@ -103,6 +115,7 @@ class ActorConfig(BaseConfig):
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+    token_sampling: TokenSamplingConfig = field(default_factory=TokenSamplingConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0
