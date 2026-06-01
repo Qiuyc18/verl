@@ -74,16 +74,25 @@ token_sampling:
   # Whether to enable token sampling in actor update
   enabled: false
 
-  # Sampling mode: none, urs, or rpc
+  # Sampling mode: none, urs, rpc, or rpc_urs
   mode: none
 
-  # Target fraction of response tokens used by the policy update
+  # Target fraction of eligible response tokens used by the policy update
   keep_ratio: 1.0
 
   # Number of early response tokens always kept per sample
   min_tokens: 1
 
-  # Whether RPC should shorten each micro-batch to the sampled max prefix
+  # RPC target prefix fraction used by rpc_urs before uniform token masking
+  truncate_ratio: 1.0
+
+  # Minimum RPC prefix length used by rpc_urs, capped by each response length
+  truncate_min_tokens: 1
+
+  # Minimum sampled loss tokens inside the rpc_urs prefix
+  sample_min_tokens: 1
+
+  # Whether prefix modes should shorten each micro-batch to the sampled max prefix
   truncate_rpc: true
 
   # Numerical floor for Horvitz-Thompson inclusion probabilities

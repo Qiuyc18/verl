@@ -126,6 +126,26 @@ class DataParallelPPOActor(BasePPOActor):
         return probs
 
     @staticmethod
+    def _uniform_probs_for_length(
+        valid_len: int, response_length: int, keep_ratio: float, min_tokens: int, eps: float, device
+    ) -> torch.Tensor:
+        probs = torch.zeros(response_length, device=device)
+        if valid_len <= 0:
+            return probs
+
+        forced = min(max(min_tokens, 0), valid_len)
+        if forced > 0:
+            probs[:forced] = 1.0
+
+        remaining = valid_len - forced
+        if remaining <= 0:
+            return probs
+
+        target = (keep_ratio * valid_len - forced) / remaining
+        probs[forced:valid_len] = min(max(target, eps), 1.0)
+        return probs
+
+    @staticmethod
     def _slice_response_field(value: torch.Tensor, keep_len: int) -> torch.Tensor:
         return value[:, :keep_len]
 
@@ -144,7 +164,7 @@ class DataParallelPPOActor(BasePPOActor):
         keep_ratio = float(token_sampling.get("keep_ratio", 1.0))
         if mode == "none" or keep_ratio >= 1.0:
             return model_inputs, {}
-        if mode not in {"urs", "rpc"}:
+        if mode not in {"urs", "rpc", "rpc_urs"}:
             raise ValueError(f"Unsupported actor token_sampling.mode: {mode}")
         if not 0.0 < keep_ratio <= 1.0:
             raise ValueError(f"actor token_sampling.keep_ratio must be in (0, 1], got {keep_ratio}")
@@ -155,28 +175,57 @@ class DataParallelPPOActor(BasePPOActor):
         valid = response_mask > 0
         valid_lens = valid.sum(dim=-1).to(torch.long)
         min_tokens = int(token_sampling.get("min_tokens", 1))
+        truncate_ratio = float(token_sampling.get("truncate_ratio", 1.0))
+        truncate_min_tokens = int(token_sampling.get("truncate_min_tokens", 1))
+        sample_min_tokens = int(token_sampling.get("sample_min_tokens", min_tokens))
         eps = float(token_sampling.get("eps", 1e-6))
+        if mode == "rpc_urs" and not 0.0 < truncate_ratio <= 1.0:
+            raise ValueError(
+                f"actor token_sampling.truncate_ratio must be in (0, 1], got {truncate_ratio}"
+            )
 
         probs = torch.zeros_like(response_mask, dtype=torch.float32)
+        prefix_lens = valid_lens.clone()
         if mode == "urs":
             for row, valid_len_tensor in enumerate(valid_lens):
-                valid_len = int(valid_len_tensor.item())
-                if valid_len <= 0:
-                    continue
-                forced = min(max(min_tokens, 0), valid_len)
-                if forced > 0:
-                    probs[row, :forced] = 1.0
-                remaining = valid_len - forced
-                if remaining > 0:
-                    target = (keep_ratio * valid_len - forced) / remaining
-                    probs[row, forced:valid_len] = min(max(target, eps), 1.0)
-        else:
+                probs[row] = self._uniform_probs_for_length(
+                    valid_len=int(valid_len_tensor.item()),
+                    response_length=response_length,
+                    keep_ratio=keep_ratio,
+                    min_tokens=min_tokens,
+                    eps=eps,
+                    device=device,
+                )
+        elif mode == "rpc":
             for row, valid_len_tensor in enumerate(valid_lens):
                 probs[row] = self._rpc_probs_for_length(
                     valid_len=int(valid_len_tensor.item()),
                     response_length=response_length,
                     keep_ratio=keep_ratio,
                     min_tokens=min_tokens,
+                    eps=eps,
+                    device=device,
+                )
+        else:
+            for row, valid_len_tensor in enumerate(valid_lens):
+                valid_len = int(valid_len_tensor.item())
+                rpc_probs = self._rpc_probs_for_length(
+                    valid_len=valid_len,
+                    response_length=response_length,
+                    keep_ratio=truncate_ratio,
+                    min_tokens=truncate_min_tokens,
+                    eps=eps,
+                    device=device,
+                )
+                rpc_sampled = (torch.rand_like(rpc_probs) < rpc_probs).float() * valid[row].float()
+                prefix_len = int(rpc_sampled.sum().item())
+                prefix_len = max(1, min(prefix_len, valid_len)) if valid_len > 0 else 0
+                prefix_lens[row] = prefix_len
+                probs[row] = self._uniform_probs_for_length(
+                    valid_len=prefix_len,
+                    response_length=response_length,
+                    keep_ratio=keep_ratio,
+                    min_tokens=sample_min_tokens,
                     eps=eps,
                     device=device,
                 )
@@ -190,6 +239,9 @@ class DataParallelPPOActor(BasePPOActor):
         if mode == "rpc" and token_sampling.get("truncate_rpc", True):
             keep_lens = sampled.sum(dim=-1).to(torch.long)
             max_keep_len = int(keep_lens.max().item()) if keep_lens.numel() > 0 else response_length
+            max_keep_len = max(1, min(max_keep_len, response_length))
+        elif mode == "rpc_urs" and token_sampling.get("truncate_rpc", True):
+            max_keep_len = int(prefix_lens.max().item()) if prefix_lens.numel() > 0 else response_length
             max_keep_len = max(1, min(max_keep_len, response_length))
 
         response_keys = {

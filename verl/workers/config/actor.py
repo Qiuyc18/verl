@@ -36,6 +36,9 @@ class TokenSamplingConfig(BaseConfig):
     mode: str = "none"
     keep_ratio: float = 1.0
     min_tokens: int = 1
+    truncate_ratio: float = 1.0
+    truncate_min_tokens: int = 1
+    sample_min_tokens: int = 1
     truncate_rpc: bool = True
     eps: float = 1e-6
 
