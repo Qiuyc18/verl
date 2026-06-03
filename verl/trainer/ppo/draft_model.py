@@ -83,6 +83,7 @@ class DraftNextTokenHead(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Return next-token logits from policy hidden states."""
+        hidden_states = hidden_states.to(dtype=_infer_module_dtype(self))
         return self.net(hidden_states)
 
     def freeze(self) -> "DraftNextTokenHead":
@@ -454,6 +455,13 @@ def _infer_module_device(module: nn.Module) -> torch.device:
         return next(module.parameters()).device
     except StopIteration:
         return torch.device("cpu")
+
+
+def _infer_module_dtype(module: nn.Module) -> torch.dtype:
+    try:
+        return next(module.parameters()).dtype
+    except StopIteration:
+        return torch.float32
 
 
 def _resolve_pad_token_id(config: OfflineDraftTrainingConfig, tokenizer: Optional[Any]) -> int:
