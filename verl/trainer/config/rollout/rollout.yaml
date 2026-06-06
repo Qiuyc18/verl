@@ -207,6 +207,7 @@ history_tree_speculation:
   enabled: False
   max_depth: 1
   max_branch_width: 8
+  max_tokens_to_store: 1024
   min_visits: 1
   count_alpha: 1.0
   use_reward_prior: False

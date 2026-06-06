@@ -262,6 +262,7 @@ class HistoryTreeSpeculativeRollout:
         self.enabled = _cfg_bool(self.config, "enabled", False)
         self.max_depth = int(_cfg_get(self.config, "max_depth", 1))
         self.max_branch_width = int(_cfg_get(self.config, "max_branch_width", 8))
+        self.max_tokens_to_store = int(_cfg_get(self.config, "max_tokens_to_store", 1024))
         self.min_visits = int(_cfg_get(self.config, "min_visits", 1))
         self.count_alpha = float(_cfg_get(self.config, "count_alpha", 1.0))
         self.reward_lambda = float(_cfg_get(self.config, "reward_lambda", 0.0))
@@ -770,6 +771,8 @@ class HistoryTreeSpeculativeRollout:
         for i in range(responses.shape[0]):
             prompt_tokens = [int(t) for t in prompts[i].tolist() if int(t) != self.pad_token_id]
             valid = int(masks[i].sum().item())
+            if self.max_tokens_to_store > 0:
+                valid = min(valid, self.max_tokens_to_store)
             tokens = [int(t) for t in responses[i, :valid].tolist()]
             logps = [float(x) for x in old_log_probs[i, :valid].tolist()]
             reward = float(rewards[i].item()) if rewards is not None else None

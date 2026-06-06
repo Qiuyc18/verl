@@ -97,6 +97,7 @@ class HistoryTreeSpeculationConfig(BaseConfig):
     enabled: bool = False
     max_depth: int = 1
     max_branch_width: int = 8
+    max_tokens_to_store: int = 1024
     min_visits: int = 1
     count_alpha: float = 1.0
     use_reward_prior: bool = False
