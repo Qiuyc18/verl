@@ -562,29 +562,19 @@ class HistoryTreeSpeculativeRollout:
         eos_ids = set(int(x) for x in eos_token_id) if isinstance(eos_token_id, (list, tuple, set)) else {int(eos_token_id)}
         self.eos_token_ids.update(eos_ids)
 
-        initial_proposals: list[list[DraftProposal]] = []
-        for item in vllm_inputs:
-            prompt_key = stable_prompt_key(list(item["prompt_token_ids"]), item.get("multi_modal_data"))
-            node_id = self.tree.find_node(prompt_key, [])
-            if node_id is None:
-                return None
-            proposals = self.tree.propose_branch(
-                node_id,
-                max_depth=self.max_depth,
-                rng=self.rng,
-                **self._dist_kwargs(),
-            )
-            if not proposals:
-                return None
-            initial_proposals.append(proposals)
-
         metrics = {
             "history_tree_enabled": 1.0,
             "tree_hit_rate": 0.0,
+            "tree_lookup_count": 0.0,
+            "tree_hit_count": 0.0,
+            "root_miss_count": 0.0,
+            "proposal_miss_count": 0.0,
             "draft_tokens_proposed": 0.0,
             "draft_tokens_accepted": 0.0,
+            "candidate_score_miss_count": 0.0,
             "residual_rejection_rate": 0.0,
             "normal_fallback_rate": 0.0,
+            "normal_fallback_count": 0.0,
             "eos_from_draft_count": 0.0,
             "eos_from_residual_count": 0.0,
             "cache_hit_rate": 0.0,
@@ -628,6 +618,7 @@ class HistoryTreeSpeculativeRollout:
                 node_id = self.tree.find_node(state["prompt_key"], state["generated"])
                 tree_lookup_count += 1
                 if node_id is None:
+                    metrics["root_miss_count"] += 1.0
                     normal_continue_indices.append(state_idx)
                     continue
                 proposals = self.tree.propose_branch(
@@ -637,6 +628,7 @@ class HistoryTreeSpeculativeRollout:
                     **self._dist_kwargs(),
                 )
                 if not proposals:
+                    metrics["proposal_miss_count"] += 1.0
                     normal_continue_indices.append(state_idx)
                     continue
                 candidate_states.append(state)
@@ -645,6 +637,7 @@ class HistoryTreeSpeculativeRollout:
 
             if normal_continue_indices:
                 normal_count += len(normal_continue_indices)
+                metrics["normal_fallback_count"] += float(len(normal_continue_indices))
                 self._continue_online_many(
                     inference_engine,
                     [states[i] for i in normal_continue_indices],
@@ -670,6 +663,8 @@ class HistoryTreeSpeculativeRollout:
             )
             if candidate_logps is None:
                 normal_count += len(candidate_states)
+                metrics["candidate_score_miss_count"] += float(len(candidate_states))
+                metrics["normal_fallback_count"] += float(len(candidate_states))
                 self._continue_online_many(
                     inference_engine,
                     candidate_states,
@@ -687,6 +682,8 @@ class HistoryTreeSpeculativeRollout:
             ):
                 if logp is None:
                     normal_count += 1
+                    metrics["candidate_score_miss_count"] += 1.0
+                    metrics["normal_fallback_count"] += 1.0
                     self._continue_online_many(
                         inference_engine,
                         [state],
@@ -742,6 +739,8 @@ class HistoryTreeSpeculativeRollout:
 
         if tree_lookup_count > 0:
             metrics["tree_hit_rate"] = float(tree_hit_count) / float(tree_lookup_count)
+        metrics["tree_lookup_count"] = float(tree_lookup_count)
+        metrics["tree_hit_count"] = float(tree_hit_count)
         proposed = metrics["draft_tokens_proposed"]
         metrics["acceptance_rate"] = metrics["draft_tokens_accepted"] / proposed if proposed > 0 else 0.0
         metrics["average_accepted_length"] = metrics["draft_tokens_accepted"] / max(float(tree_hit_count), 1.0)
