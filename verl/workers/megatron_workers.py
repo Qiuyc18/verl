@@ -706,6 +706,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    def update_history_tree(self, batch: DataProto):
+        assert self._is_rollout
+        metrics = {}
+        if hasattr(self.rollout, "update_history_tree"):
+            metrics = self.rollout.update_history_tree(batch)
+        return DataProto(meta_info={"metrics": metrics})
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
     @DistProfiler.annotate(color="olive")

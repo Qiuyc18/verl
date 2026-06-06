@@ -953,6 +953,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         get_torch_device().empty_cache()
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    def update_history_tree(self, batch: DataProto):
+        assert self._is_rollout
+        metrics = {}
+        if hasattr(self.rollout, "update_history_tree"):
+            metrics = self.rollout.update_history_tree(batch)
+        return DataProto(meta_info={"metrics": metrics})
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):

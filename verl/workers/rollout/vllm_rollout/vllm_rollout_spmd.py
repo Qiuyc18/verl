@@ -81,6 +81,7 @@ from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.history_tree_speculation import HistoryTreeSpeculativeRollout
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -270,6 +271,11 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self.history_tree_speculation = HistoryTreeSpeculativeRollout(
+            config=config,
+            pad_token_id=self.pad_token_id,
+            eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        )
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -380,32 +386,50 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
+            history_tree_output = None
+            if do_sample and not is_validate and self.history_tree_speculation.enabled:
+                history_tree_output = self.history_tree_speculation.generate_sequences(
+                    inference_engine=self.inference_engine,
+                    vllm_inputs=vllm_inputs,
+                    sampling_params=self.sampling_params,
+                    response_length=self.config.response_length,
+                    eos_token_id=eos_token_id,
+                    lora_requests=lora_requests,
+                    ignore_eos=self.config.ignore_eos,
+                )
 
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+            if history_tree_output is None:
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    lora_request=lora_requests,
+                    use_tqdm=False,
+                )
 
-            response = []
-            rollout_log_probs = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
-                    if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+                # TODO(sgm): disable logprob when recompute_log_prob is enable
+                # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+
+                response = []
+                rollout_log_probs = []
+                for output in outputs:
+                    for sample_id in range(len(output.outputs)):
+                        response_ids = output.outputs[sample_id].token_ids
+                        response.append(response_ids)
+                        if self.config.calculate_log_probs:
+                            curr_log_prob = []
+                            for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                                curr_log_prob.append(logprob[response_ids[i]].logprob)
+                            rollout_log_probs.append(curr_log_prob)
+                history_tree_metrics = None
+            else:
+                response = history_tree_output["responses"]
+                rollout_log_probs = history_tree_output["rollout_log_probs"]
+                history_tree_metrics = history_tree_output["metrics"]
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
             )
-            if self.config.calculate_log_probs:
+            if self.config.calculate_log_probs or history_tree_metrics is not None:
                 rollout_log_probs = pad_2d_list_to_length(
                     rollout_log_probs, -1, max_length=self.config.response_length
                 ).to(idx.device)
@@ -444,8 +468,13 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+        if history_tree_metrics is not None:
+            batch["rollout_log_probs"] = rollout_log_probs
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        meta_info = {}
+        if history_tree_metrics is not None:
+            meta_info["history_tree_metrics"] = history_tree_metrics
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.
@@ -494,6 +523,10 @@ class vLLMRollout(BaseRollout):
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
             model.load_weights(weights)
+        self.history_tree_speculation.bump_policy_version()
+
+    def update_history_tree(self, batch: DataProto) -> dict[str, float]:
+        return self.history_tree_speculation.update_tree_from_batch(batch)
 
 
 # https://github.com/vllm-project/vllm/issues/13175

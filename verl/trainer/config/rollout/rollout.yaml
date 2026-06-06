@@ -196,6 +196,28 @@ multi_turn:
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False
 
+# Optional exact rollout-time verifier using a history trajectory tree as q_T.
+# Disabled by default; q_T only proposes tokens, while emitted rollout_log_probs
+# are always online-policy logprobs.
+history_tree_speculation:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.HistoryTreeSpeculationConfig
+
+  enabled: False
+  max_depth: 1
+  max_branch_width: 8
+  min_visits: 1
+  count_alpha: 1.0
+  use_reward_prior: False
+  reward_lambda: 0.0
+  use_nll_prior: False
+  nll_eta: 0.0
+  exact_residual: True
+  debug_verify_distribution: False
+  candidate_prompt_logprobs: 20
+  max_residual_attempts: 0
+
 # [Experimental] agent loop based rollout configs
 agent:
 

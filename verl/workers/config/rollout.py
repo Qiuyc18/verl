@@ -27,6 +27,7 @@ __all__ = [
     "AgentLoopConfig",
     "TraceConfig",
     "ServerConfig",
+    "HistoryTreeSpeculationConfig",
     "RolloutConfig",
 ]
 
@@ -92,6 +93,23 @@ class ServerConfig(BaseConfig):
 
 
 @dataclass
+class HistoryTreeSpeculationConfig(BaseConfig):
+    enabled: bool = False
+    max_depth: int = 1
+    max_branch_width: int = 8
+    min_visits: int = 1
+    count_alpha: float = 1.0
+    use_reward_prior: bool = False
+    reward_lambda: float = 0.0
+    use_nll_prior: bool = False
+    nll_eta: float = 0.0
+    exact_residual: bool = True
+    debug_verify_distribution: bool = False
+    candidate_prompt_logprobs: int = 20
+    max_residual_attempts: int = 0
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
@@ -153,6 +171,8 @@ class RolloutConfig(BaseConfig):
 
     # Server configuration for sglang server mode
     server: ServerConfig = field(default_factory=ServerConfig)
+
+    history_tree_speculation: HistoryTreeSpeculationConfig = field(default_factory=HistoryTreeSpeculationConfig)
 
     update_weights_bucket_megabytes: int = 512
 

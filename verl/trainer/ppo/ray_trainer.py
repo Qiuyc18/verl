@@ -1128,6 +1128,9 @@ class RayPPOTrainer:
                                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                             else:
                                 gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            history_tree_metrics = gen_batch_output.meta_info.get("history_tree_metrics", None)
+                            if history_tree_metrics:
+                                metrics.update({f"history_tree/{k}": v for k, v in history_tree_metrics.items()})
                             timing_raw.update(gen_batch_output.meta_info["timing"])
                             gen_batch_output.meta_info.pop("timing", None)
 
@@ -1251,6 +1254,22 @@ class RayPPOTrainer:
                         if not from_cache and self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+
+                        history_tree_cfg = self.config.actor_rollout_ref.rollout.get(
+                            "history_tree_speculation", None
+                        )
+                        history_tree_enabled = history_tree_cfg and history_tree_cfg.get("enabled", False)
+                        if not from_cache and history_tree_enabled and not self.async_rollout_mode:
+                            try:
+                                history_tree_update = self.actor_rollout_wg.update_history_tree(batch)
+                                update_metrics = history_tree_update.meta_info.get("metrics", {})
+                                for key, value in update_metrics.items():
+                                    if isinstance(value, list) and len(value) > 0:
+                                        value = sum(value) / len(value)
+                                    metrics[f"history_tree/{key}"] = value
+                            except Exception as exc:
+                                logger.warning(f"history tree update failed; continuing without reward-prior update: {exc}")
+                                metrics["history_tree/update_failed"] = 1
 
                         # save fresh experience to replay buffer
                         if not from_cache and replay_buffer is not None:
