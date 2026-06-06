@@ -407,6 +407,23 @@ class HistoryTreeSpeculativeRollout:
             return None
         eos_ids = set(int(x) for x in eos_token_id) if isinstance(eos_token_id, (list, tuple, set)) else {int(eos_token_id)}
         self.eos_token_ids.update(eos_ids)
+
+        initial_proposals: list[list[DraftProposal]] = []
+        for item in vllm_inputs:
+            prompt_key = stable_prompt_key(list(item["prompt_token_ids"]), item.get("multi_modal_data"))
+            node_id = self.tree.find_node(prompt_key, [])
+            if node_id is None:
+                return None
+            proposals = self.tree.propose_branch(
+                node_id,
+                max_depth=self.max_depth,
+                rng=self.rng,
+                **self._dist_kwargs(),
+            )
+            if not proposals:
+                return None
+            initial_proposals.append(proposals)
+
         responses: list[list[int]] = []
         rollout_log_probs: list[list[float]] = []
         metrics = {
@@ -433,29 +450,29 @@ class HistoryTreeSpeculativeRollout:
             generated: list[int] = []
             logps: list[float] = []
             lora_request = lora_requests[seq_idx] if lora_requests is not None else None
+            proposals = initial_proposals[seq_idx]
 
             while len(generated) < response_length:
                 node_id = self.tree.find_node(prompt_key, generated)
                 tree_lookup_count += 1
-                proposals = []
-                if node_id is not None:
+                if generated:
+                    proposals = []
+                    if node_id is not None:
+                        proposals = self.tree.propose_branch(
+                            node_id,
+                            max_depth=min(self.max_depth, response_length - len(generated)),
+                            rng=self.rng,
+                            **self._dist_kwargs(),
+                        )
+                if not proposals:
+                    return None
+                if node_id is not None and not generated:
                     proposals = self.tree.propose_branch(
                         node_id,
                         max_depth=min(self.max_depth, response_length - len(generated)),
                         rng=self.rng,
                         **self._dist_kwargs(),
                     )
-                if not proposals:
-                    normal_count += 1
-                    token_id, logp = self._sample_online_one(
-                        inference_engine, prefix, multi_modal_data, sampling_params, lora_request
-                    )
-                    generated.append(token_id)
-                    logps.append(logp)
-                    prefix.append(token_id)
-                    if not ignore_eos and token_id in eos_ids:
-                        break
-                    continue
 
                 tree_hit_count += 1
                 stopped_block = False
@@ -513,7 +530,6 @@ class HistoryTreeSpeculativeRollout:
 
             responses.append(generated)
             rollout_log_probs.append(logps)
-            self.tree.observe(prompt_key, generated, logps, reward=None, policy_version=self.policy_version)
 
         if tree_lookup_count > 0:
             metrics["tree_hit_rate"] = float(tree_hit_count) / float(tree_lookup_count)
