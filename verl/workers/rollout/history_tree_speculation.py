@@ -310,6 +310,39 @@ class HistoryTreeSpeculativeRollout:
             item["multi_modal_data"] = multi_modal_data
         return item
 
+    @staticmethod
+    def _lora_batch_arg(lora_requests: Optional[list[Any]]) -> Optional[list[Any]]:
+        if lora_requests is None or all(req is None for req in lora_requests):
+            return None
+        return lora_requests
+
+    def _sample_online_many(
+        self,
+        inference_engine: Any,
+        prefixes: list[list[int]],
+        multi_modal_data: list[Optional[Any]],
+        sampling_params: Any,
+        lora_requests: Optional[list[Any]],
+    ) -> list[tuple[int, float]]:
+        if not prefixes:
+            return []
+        params = self._clone_sampling_params(sampling_params, max_tokens=1, n=1, logprobs=1)
+        outputs = inference_engine.generate(
+            prompts=[
+                self._vllm_input(prefix, mm_data) for prefix, mm_data in zip(prefixes, multi_modal_data, strict=True)
+            ],
+            sampling_params=params,
+            lora_request=self._lora_batch_arg(lora_requests),
+            use_tqdm=False,
+        )
+        sampled: list[tuple[int, float]] = []
+        for output in outputs:
+            sample = output.outputs[0]
+            token_id = int(sample.token_ids[0])
+            logprob = sample.logprobs[0][token_id].logprob
+            sampled.append((token_id, float(logprob)))
+        return sampled
+
     def _sample_online_one(
         self,
         inference_engine: Any,
@@ -318,17 +351,59 @@ class HistoryTreeSpeculativeRollout:
         sampling_params: Any,
         lora_request: Optional[Any],
     ) -> tuple[int, float]:
-        params = self._clone_sampling_params(sampling_params, max_tokens=1, n=1, logprobs=1)
-        outputs = inference_engine.generate(
-            prompts=[self._vllm_input(prefix, multi_modal_data)],
-            sampling_params=params,
-            lora_request=[lora_request] if lora_request is not None else None,
-            use_tqdm=False,
+        return self._sample_online_many(
+            inference_engine,
+            [prefix],
+            [multi_modal_data],
+            sampling_params,
+            [lora_request] if lora_request is not None else None,
+        )[0]
+
+    def _score_candidates_online(
+        self,
+        inference_engine: Any,
+        prefixes: list[list[int]],
+        token_ids: list[int],
+        multi_modal_data: list[Optional[Any]],
+        sampling_params: Any,
+        lora_requests: Optional[list[Any]],
+    ) -> Optional[list[Optional[float]]]:
+        if not prefixes:
+            return []
+        params = self._clone_sampling_params(
+            sampling_params,
+            max_tokens=1,
+            n=1,
+            logprobs=1,
+            prompt_logprobs=self.candidate_prompt_logprobs,
         )
-        sample = outputs[0].outputs[0]
-        token_id = int(sample.token_ids[0])
-        logprob = sample.logprobs[0][token_id].logprob
-        return token_id, float(logprob)
+        try:
+            outputs = inference_engine.generate(
+                prompts=[
+                    self._vllm_input([*prefix, int(token_id)], mm_data)
+                    for prefix, token_id, mm_data in zip(prefixes, token_ids, multi_modal_data, strict=True)
+                ],
+                sampling_params=params,
+                lora_request=self._lora_batch_arg(lora_requests),
+                use_tqdm=False,
+            )
+        except Exception as exc:
+            if not self._warned_unavailable:
+                logger.warning(f"history tree candidate scoring failed; falling back to normal vLLM rollout: {exc}")
+                self._warned_unavailable = True
+            return None
+        logps: list[Optional[float]] = []
+        for output, token_id in zip(outputs, token_ids, strict=True):
+            prompt_logprobs = getattr(output, "prompt_logprobs", None)
+            if not prompt_logprobs:
+                logps.append(None)
+                continue
+            last = prompt_logprobs[-1]
+            if last is None or int(token_id) not in last:
+                logps.append(None)
+                continue
+            logps.append(float(last[int(token_id)].logprob))
+        return logps
 
     def _score_candidate_online(
         self,
@@ -339,32 +414,17 @@ class HistoryTreeSpeculativeRollout:
         sampling_params: Any,
         lora_request: Optional[Any],
     ) -> Optional[float]:
-        params = self._clone_sampling_params(
+        scores = self._score_candidates_online(
+            inference_engine,
+            [prefix],
+            [token_id],
+            [multi_modal_data],
             sampling_params,
-            max_tokens=1,
-            n=1,
-            logprobs=1,
-            prompt_logprobs=self.candidate_prompt_logprobs,
+            [lora_request] if lora_request is not None else None,
         )
-        try:
-            outputs = inference_engine.generate(
-                prompts=[self._vllm_input([*prefix, int(token_id)], multi_modal_data)],
-                sampling_params=params,
-                lora_request=[lora_request] if lora_request is not None else None,
-                use_tqdm=False,
-            )
-        except Exception as exc:
-            if not self._warned_unavailable:
-                logger.warning(f"history tree candidate scoring failed; falling back to normal vLLM rollout: {exc}")
-                self._warned_unavailable = True
+        if scores is None:
             return None
-        prompt_logprobs = getattr(outputs[0], "prompt_logprobs", None)
-        if not prompt_logprobs:
-            return None
-        last = prompt_logprobs[-1]
-        if last is None or int(token_id) not in last:
-            return None
-        return float(last[int(token_id)].logprob)
+        return scores[0]
 
     def _sample_residual_one(
         self,
@@ -392,6 +452,99 @@ class HistoryTreeSpeculativeRollout:
             if self.max_residual_attempts > 0 and attempts >= self.max_residual_attempts:
                 logger.warning("history tree residual sampling reached max_residual_attempts; falling back to p sample")
                 return self._sample_online_one(inference_engine, prefix, multi_modal_data, sampling_params, lora_request)
+
+    def _sample_residual_many(
+        self,
+        inference_engine: Any,
+        states: list[dict[str, Any]],
+        node_ids: list[int],
+        sampling_params: Any,
+    ) -> list[tuple[int, float]]:
+        if not states:
+            return []
+        if not self.exact_residual:
+            return self._sample_online_many(
+                inference_engine,
+                [state["prefix"] for state in states],
+                [state["multi_modal_data"] for state in states],
+                sampling_params,
+                [state["lora_request"] for state in states],
+            )
+
+        q_by_state: list[dict[int, float]] = []
+        for node_id in node_ids:
+            token_ids, q_probs = self.tree.child_distribution(node_id, **self._dist_kwargs())
+            q_by_state.append({int(t): float(q) for t, q in zip(token_ids, q_probs, strict=True)})
+
+        results: list[Optional[tuple[int, float]]] = [None] * len(states)
+        unresolved = list(range(len(states)))
+        attempts = 0
+        while unresolved:
+            attempts += 1
+            sampled = self._sample_online_many(
+                inference_engine,
+                [states[i]["prefix"] for i in unresolved],
+                [states[i]["multi_modal_data"] for i in unresolved],
+                sampling_params,
+                [states[i]["lora_request"] for i in unresolved],
+            )
+            next_unresolved = []
+            for state_idx, (token_id, logp) in zip(unresolved, sampled, strict=True):
+                p = math.exp(logp)
+                q = q_by_state[state_idx].get(token_id, 0.0)
+                if q <= 0.0 or (p > q and self.rng.random() <= (1.0 - q / p)):
+                    results[state_idx] = (token_id, logp)
+                else:
+                    next_unresolved.append(state_idx)
+            if self.max_residual_attempts > 0 and attempts >= self.max_residual_attempts and next_unresolved:
+                logger.warning("history tree residual sampling reached max_residual_attempts; falling back to p sample")
+                sampled = self._sample_online_many(
+                    inference_engine,
+                    [states[i]["prefix"] for i in next_unresolved],
+                    [states[i]["multi_modal_data"] for i in next_unresolved],
+                    sampling_params,
+                    [states[i]["lora_request"] for i in next_unresolved],
+                )
+                for state_idx, sample in zip(next_unresolved, sampled, strict=True):
+                    results[state_idx] = sample
+                break
+            unresolved = next_unresolved
+
+        return [result for result in results if result is not None]
+
+    def _continue_online_many(
+        self,
+        inference_engine: Any,
+        states: list[dict[str, Any]],
+        sampling_params: Any,
+        response_length: int,
+        eos_ids: set[int],
+        ignore_eos: bool,
+    ) -> None:
+        if not states:
+            return
+        max_remaining = max(response_length - len(state["generated"]) for state in states)
+        if max_remaining <= 0:
+            return
+        params = self._clone_sampling_params(sampling_params, max_tokens=max_remaining, n=1, logprobs=1)
+        outputs = inference_engine.generate(
+            prompts=[self._vllm_input(state["prefix"], state["multi_modal_data"]) for state in states],
+            sampling_params=params,
+            lora_request=self._lora_batch_arg([state["lora_request"] for state in states]),
+            use_tqdm=False,
+        )
+        for state, output in zip(states, outputs, strict=True):
+            remaining = response_length - len(state["generated"])
+            sample = output.outputs[0]
+            token_ids = list(sample.token_ids)[:remaining]
+            for pos, token_id in enumerate(token_ids):
+                token_id = int(token_id)
+                state["generated"].append(token_id)
+                state["prefix"].append(token_id)
+                state["logps"].append(float(sample.logprobs[pos][token_id].logprob))
+                if not ignore_eos and token_id in eos_ids:
+                    break
+            state["finished"] = True
 
     def generate_sequences(
         self,
@@ -424,8 +577,6 @@ class HistoryTreeSpeculativeRollout:
                 return None
             initial_proposals.append(proposals)
 
-        responses: list[list[int]] = []
-        rollout_log_probs: list[list[float]] = []
         metrics = {
             "history_tree_enabled": 1.0,
             "tree_hit_rate": 0.0,
@@ -443,93 +594,150 @@ class HistoryTreeSpeculativeRollout:
         residual_count = 0
         normal_count = 0
 
+        states: list[dict[str, Any]] = []
         for seq_idx, item in enumerate(vllm_inputs):
-            prefix = list(item["prompt_token_ids"])
+            prompt_tokens = list(item["prompt_token_ids"])
             multi_modal_data = item.get("multi_modal_data")
-            prompt_key = stable_prompt_key(prefix, multi_modal_data)
-            generated: list[int] = []
-            logps: list[float] = []
-            lora_request = lora_requests[seq_idx] if lora_requests is not None else None
-            proposals = initial_proposals[seq_idx]
+            states.append(
+                {
+                    "prefix": list(prompt_tokens),
+                    "prompt_key": stable_prompt_key(prompt_tokens, multi_modal_data),
+                    "multi_modal_data": multi_modal_data,
+                    "generated": [],
+                    "logps": [],
+                    "finished": False,
+                    "lora_request": lora_requests[seq_idx] if lora_requests is not None else None,
+                }
+            )
 
-            while len(generated) < response_length:
-                node_id = self.tree.find_node(prompt_key, generated)
+        while True:
+            active_indices = [
+                i for i, state in enumerate(states) if not state["finished"] and len(state["generated"]) < response_length
+            ]
+            if not active_indices:
+                break
+
+            candidate_states: list[dict[str, Any]] = []
+            candidate_node_ids: list[int] = []
+            candidate_proposals: list[DraftProposal] = []
+            normal_continue_indices: list[int] = []
+
+            for state_idx in active_indices:
+                state = states[state_idx]
+                node_id = self.tree.find_node(state["prompt_key"], state["generated"])
                 tree_lookup_count += 1
-                if generated:
-                    proposals = []
-                    if node_id is not None:
-                        proposals = self.tree.propose_branch(
-                            node_id,
-                            max_depth=min(self.max_depth, response_length - len(generated)),
-                            rng=self.rng,
-                            **self._dist_kwargs(),
-                        )
+                if node_id is None:
+                    normal_continue_indices.append(state_idx)
+                    continue
+                proposals = self.tree.propose_branch(
+                    node_id,
+                    max_depth=1,
+                    rng=self.rng,
+                    **self._dist_kwargs(),
+                )
                 if not proposals:
-                    return None
-                if node_id is not None and not generated:
-                    proposals = self.tree.propose_branch(
-                        node_id,
-                        max_depth=min(self.max_depth, response_length - len(generated)),
-                        rng=self.rng,
-                        **self._dist_kwargs(),
-                    )
+                    normal_continue_indices.append(state_idx)
+                    continue
+                candidate_states.append(state)
+                candidate_node_ids.append(node_id)
+                candidate_proposals.append(proposals[0])
 
-                tree_hit_count += 1
-                stopped_block = False
-                for proposal in proposals:
-                    if len(generated) >= response_length:
-                        break
-                    metrics["draft_tokens_proposed"] += 1.0
-                    metrics["verifier_extra_forward_count"] += 1.0
-                    logp = self._score_candidate_online(
-                        inference_engine,
-                        prefix,
-                        proposal.token_id,
-                        multi_modal_data,
-                        sampling_params,
-                        lora_request,
-                    )
-                    if logp is None:
-                        if not self._warned_unavailable:
-                            logger.warning(
-                                "history tree speculation needs vLLM prompt_logprobs for exact verification; "
-                                "falling back to normal vLLM rollout"
-                            )
-                            self._warned_unavailable = True
-                        return None
-                    log_alpha = min(0.0, logp - proposal.logq_tree_token)
-                    if math.log(max(self.rng.random(), 1e-12)) <= log_alpha:
-                        metrics["draft_tokens_accepted"] += 1.0
-                        generated.append(proposal.token_id)
-                        logps.append(logp)
-                        prefix.append(proposal.token_id)
-                        if not ignore_eos and proposal.token_id in eos_ids:
-                            metrics["eos_from_draft_count"] += 1.0
-                            stopped_block = True
-                            break
-                        continue
+            if normal_continue_indices:
+                normal_count += len(normal_continue_indices)
+                self._continue_online_many(
+                    inference_engine,
+                    [states[i] for i in normal_continue_indices],
+                    sampling_params,
+                    response_length,
+                    eos_ids,
+                    ignore_eos,
+                )
 
-                    residual_count += 1
-                    token_id, residual_logp = self._sample_residual_one(
+            if not candidate_states:
+                continue
+
+            tree_hit_count += len(candidate_states)
+            metrics["draft_tokens_proposed"] += float(len(candidate_states))
+            metrics["verifier_extra_forward_count"] += 1.0
+            candidate_logps = self._score_candidates_online(
+                inference_engine,
+                [state["prefix"] for state in candidate_states],
+                [proposal.token_id for proposal in candidate_proposals],
+                [state["multi_modal_data"] for state in candidate_states],
+                sampling_params,
+                [state["lora_request"] for state in candidate_states],
+            )
+            if candidate_logps is None:
+                normal_count += len(candidate_states)
+                self._continue_online_many(
+                    inference_engine,
+                    candidate_states,
+                    sampling_params,
+                    response_length,
+                    eos_ids,
+                    ignore_eos,
+                )
+                continue
+
+            residual_states: list[dict[str, Any]] = []
+            residual_node_ids: list[int] = []
+            for state, node_id, proposal, logp in zip(
+                candidate_states, candidate_node_ids, candidate_proposals, candidate_logps, strict=True
+            ):
+                if logp is None:
+                    normal_count += 1
+                    self._continue_online_many(
                         inference_engine,
-                        prefix,
-                        node_id,
-                        multi_modal_data,
+                        [state],
                         sampling_params,
-                        lora_request,
+                        response_length,
+                        eos_ids,
+                        ignore_eos,
                     )
-                    generated.append(token_id)
-                    logps.append(residual_logp)
-                    prefix.append(token_id)
+                    continue
+
+                log_alpha = min(0.0, logp - proposal.logq_tree_token)
+                if math.log(max(self.rng.random(), 1e-12)) <= log_alpha:
+                    metrics["draft_tokens_accepted"] += 1.0
+                    token_id = proposal.token_id
+                    state["generated"].append(token_id)
+                    state["logps"].append(logp)
+                    state["prefix"].append(token_id)
+                    if len(state["generated"]) >= response_length:
+                        state["finished"] = True
+                    if not ignore_eos and token_id in eos_ids:
+                        metrics["eos_from_draft_count"] += 1.0
+                        state["finished"] = True
+                    continue
+
+                residual_count += 1
+                residual_states.append(state)
+                residual_node_ids.append(node_id)
+
+            if residual_states:
+                residual_samples = self._sample_residual_many(
+                    inference_engine,
+                    residual_states,
+                    residual_node_ids,
+                    sampling_params,
+                )
+                for state, (token_id, residual_logp) in zip(residual_states, residual_samples, strict=True):
+                    state["generated"].append(token_id)
+                    state["logps"].append(residual_logp)
+                    state["prefix"].append(token_id)
                     if not ignore_eos and token_id in eos_ids:
                         metrics["eos_from_residual_count"] += 1.0
-                    stopped_block = True
-                    break
-                if stopped_block and (not ignore_eos and generated[-1] in eos_ids):
-                    break
-
-            responses.append(generated)
-            rollout_log_probs.append(logps)
+                        state["finished"] = True
+                    if len(state["generated"]) >= response_length:
+                        state["finished"] = True
+                self._continue_online_many(
+                    inference_engine,
+                    [state for state in residual_states if not state["finished"]],
+                    sampling_params,
+                    response_length,
+                    eos_ids,
+                    ignore_eos,
+                )
 
         if tree_lookup_count > 0:
             metrics["tree_hit_rate"] = float(tree_hit_count) / float(tree_lookup_count)
@@ -539,7 +747,11 @@ class HistoryTreeSpeculativeRollout:
         denom = float(tree_hit_count + normal_count + residual_count)
         metrics["normal_fallback_rate"] = float(normal_count) / max(denom, 1.0)
         metrics["residual_rejection_rate"] = float(residual_count) / max(float(tree_hit_count), 1.0)
-        return {"responses": responses, "rollout_log_probs": rollout_log_probs, "metrics": metrics}
+        return {
+            "responses": [state["generated"] for state in states],
+            "rollout_log_probs": [state["logps"] for state in states],
+            "metrics": metrics,
+        }
 
     def update_tree_from_batch(self, batch: Any) -> dict[str, float]:
         if not self.enabled:
