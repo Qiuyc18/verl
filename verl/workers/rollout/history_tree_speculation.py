@@ -766,15 +766,21 @@ class HistoryTreeSpeculativeRollout:
         rewards = None
         if "token_level_scores" in batch.batch.keys():
             rewards = batch.batch["token_level_scores"].detach().cpu().sum(dim=-1)
+        prompt_keys = batch.non_tensor_batch.get("history_tree_prompt_keys", None)
         updated = 0
         for i in range(responses.shape[0]):
-            prompt_tokens = [int(t) for t in prompts[i].tolist() if int(t) != self.pad_token_id]
+            prompt_key = None
+            if prompt_keys is not None and i < len(prompt_keys):
+                prompt_key = str(prompt_keys[i])
+            if not prompt_key:
+                prompt_tokens = [int(t) for t in prompts[i].tolist() if int(t) != self.pad_token_id]
+                prompt_key = stable_prompt_key(prompt_tokens)
             valid = int(masks[i].sum().item())
             if self.max_tokens_to_store > 0:
                 valid = min(valid, self.max_tokens_to_store)
             tokens = [int(t) for t in responses[i, :valid].tolist()]
             logps = [float(x) for x in old_log_probs[i, :valid].tolist()]
             reward = float(rewards[i].item()) if rewards is not None else None
-            self.tree.observe(stable_prompt_key(prompt_tokens), tokens, logps, reward=reward, policy_version=self.policy_version)
+            self.tree.observe(prompt_key, tokens, logps, reward=reward, policy_version=self.policy_version)
             updated += 1
         return {"history_tree_updated_sequences": float(updated), "history_tree_nodes": float(len(self.tree.nodes))}

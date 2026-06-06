@@ -81,7 +81,7 @@ from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
-from verl.workers.rollout.history_tree_speculation import HistoryTreeSpeculativeRollout
+from verl.workers.rollout.history_tree_speculation import HistoryTreeSpeculativeRollout, stable_prompt_key
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -354,6 +354,13 @@ class vLLMRollout(BaseRollout):
                 )
 
             input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
+        non_tensor_batch["history_tree_prompt_keys"] = np.array(
+            [
+                stable_prompt_key(list(input_data["prompt_token_ids"]), input_data.get("multi_modal_data"))
+                for input_data in vllm_inputs
+            ],
+            dtype=object,
+        )
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
